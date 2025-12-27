@@ -1,11 +1,112 @@
 from flask import Flask, request, jsonify, render_template_string
-from datetime import datetime
-import itertools
+from datetime import datetime, timedelta
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import json
+import sqlite3
+from pathlib import Path
 
 app = Flask(__name__)
 
-messages = []                              # chat ciphertext or poll objects
-poll_id_counter = itertools.count(1)       # unique poll IDs
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / 'chat.db'
+
+MAX_REQUEST_BYTES = 1_000_000
+MAX_TEXT_LENGTH = 2000
+MAX_USERNAME_LENGTH = 40
+MAX_OPTIONS = 6
+MAX_OPTION_LENGTH = 120
+POLL_DURATION = timedelta(hours=6)
+
+app.config['MAX_CONTENT_LENGTH'] = MAX_REQUEST_BYTES
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["120 per minute"],
+)
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS polls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            question TEXT NOT NULL,
+            options TEXT NOT NULL,
+            votes TEXT NOT NULL,
+            voters TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            closed INTEGER NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def request_too_large():
+    content_length = request.content_length
+    return content_length is not None and content_length > MAX_REQUEST_BYTES
+
+
+def iso_now():
+    return datetime.utcnow().isoformat()
+
+
+def friendly_timestamp():
+    return datetime.now().strftime('%I:%M %p')
+
+
+def normalize_username(value):
+    username = (value or '').strip()
+    if not username or len(username) > MAX_USERNAME_LENGTH:
+        return None
+    return username
+
+
+def parse_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def poll_row_to_payload(row):
+    return {
+        'type': 'poll',
+        'id': row['id'],
+        'question': row['question'],
+        'options': json.loads(row['options']),
+        'votes': json.loads(row['votes']),
+        'voters': json.loads(row['voters']),
+        'timestamp': datetime.fromisoformat(row['created_at']).strftime('%I:%M %p'),
+        'username': row['created_by'],
+        'closed': bool(row['closed']),
+        'expires_at': row['expires_at'],
+    }
+
+
+def poll_is_expired(row):
+    return datetime.fromisoformat(row['expires_at']) <= datetime.utcnow()
+
+
+init_db()
 
 # ---------------------------------------------------------------------
 #                          HTML + JavaScript
@@ -46,8 +147,18 @@ const enc=new TextEncoder(),dec=new TextDecoder();
 let key=null,lastRendered=0;
 let me=localStorage.getItem('me')||null;   // saved display‑name
 
-async function deriveKey(p){const h=await crypto.subtle.digest('SHA-256',enc.encode(p));
-  return crypto.subtle.importKey('raw',h,'AES-GCM',false,['encrypt','decrypt']);}
+const KDF_SALT='encrypted-chat-salt-v1';
+const KDF_ITERATIONS=120000;
+async function deriveKey(p){
+  const baseKey=await crypto.subtle.importKey('raw',enc.encode(p),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {name:'PBKDF2',salt:enc.encode(KDF_SALT),iterations:KDF_ITERATIONS,hash:'SHA-256'},
+    baseKey,
+    {name:'AES-GCM',length:256},
+    false,
+    ['encrypt','decrypt']
+  );
+}
 async function encrypt(o){const iv=crypto.getRandomValues(new Uint8Array(12));
   const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,enc.encode(JSON.stringify(o)));
   return{iv:toB64(iv),cipher:toB64(ct)};}
@@ -85,7 +196,7 @@ function renderPoll(p){
     const btn=document.createElement('button');
     btn.className='option-btn';
     btn.innerHTML=`${opt}<br>${bar}`;
-    btn.disabled= (me in p.voters);
+    btn.disabled= (me in p.voters) || p.closed;
     btn.onclick=()=>vote(p.id,i);
     wrap.appendChild(btn);
   });
@@ -174,12 +285,34 @@ window.addEventListener('load',async()=>{
 #                           Flask routes (chat)
 # ---------------------------------------------------------------------
 @app.route('/', methods=['GET','POST'])
+@limiter.limit("30 per minute")
 def chat():
     if request.method=='POST':
-        m=request.get_json() or {}
-        m['timestamp']=datetime.now().strftime('%I:%M %p')
-        messages.append(m)
-        return '',204
+        if request_too_large():
+            return 'Payload too large', 413
+        m = request.get_json() or {}
+        username = normalize_username(m.get('username'))
+        cipher = m.get('cipher')
+        iv = m.get('iv')
+        if not username or not isinstance(cipher, str) or not isinstance(iv, str):
+            return 'Invalid message', 400
+        if len(cipher) > MAX_REQUEST_BYTES or len(iv) > 64:
+            return 'Payload too large', 413
+        payload = {
+            'username': username,
+            'cipher': cipher,
+            'iv': iv,
+            'timestamp': friendly_timestamp(),
+            'type': 'chat',
+        }
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO messages (type, payload, created_at) VALUES (?, ?, ?)",
+            ('chat', json.dumps(payload), iso_now()),
+        )
+        conn.commit()
+        conn.close()
+        return '', 204
     return render_template_string(HTML)
 
 # ---------------------------------------------------------------------
@@ -189,60 +322,134 @@ def chat():
 # ---------------------------------------------------------------------
 #                         Poll & Vote endpoints
 # ---------------------------------------------------------------------
-def find_poll(poll_id):
-    for msg in messages:
-        if msg.get('type') == 'poll' and msg.get('id') == poll_id:
-            return msg
-    return None
-
 @app.route('/poll', methods=['POST'])
+@limiter.limit("10 per minute")
 def new_poll():
     """
     Body: {question:str, options:[str], username:str}
     """
+    if request_too_large():
+        return 'Payload too large', 413
     data = request.get_json() or {}
-    q = data.get('question', '').strip()
-    opts = [o.strip() for o in data.get('options', []) if o.strip()]
-    user = data.get('username', '').strip()
-    if len(q) == 0 or len(opts) < 2:
+    q = (data.get('question') or '').strip()
+    opts = [o.strip() for o in data.get('options', []) if o and o.strip()]
+    user = normalize_username(data.get('username'))
+    if not user:
+        return 'Invalid username', 400
+    if len(q) == 0 or len(q) > MAX_TEXT_LENGTH:
+        return 'Bad poll', 400
+    if len(opts) < 2 or len(opts) > MAX_OPTIONS:
+        return 'Bad poll', 400
+    if any(len(opt) > MAX_OPTION_LENGTH for opt in opts):
         return 'Bad poll', 400
 
-    poll_obj = {
-        'type': 'poll',
-        'id': next(poll_id_counter),
+    now = datetime.utcnow()
+    poll_payload = {
         'question': q,
-        'options': opts,
-        'votes': [0] * len(opts),   # parallel list counts
-        'voters': {},               # username -> option index
-        'timestamp': datetime.now().strftime('%I:%M %p'),
-        'username': user            # who created it
+        'options': json.dumps(opts),
+        'votes': json.dumps([0] * len(opts)),
+        'voters': json.dumps({}),
+        'created_at': now.isoformat(),
+        'created_by': user,
+        'closed': 0,
+        'expires_at': (now + POLL_DURATION).isoformat(),
     }
-    messages.append(poll_obj)
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO polls (question, options, votes, voters, created_at, created_by, closed, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            poll_payload['question'],
+            poll_payload['options'],
+            poll_payload['votes'],
+            poll_payload['voters'],
+            poll_payload['created_at'],
+            poll_payload['created_by'],
+            poll_payload['closed'],
+            poll_payload['expires_at'],
+        ),
+    )
+    conn.commit()
+    conn.close()
     return '', 201
 
 
 @app.route('/vote', methods=['POST'])
+@limiter.limit("60 per minute")
 def vote():
     """
     Body: {poll_id:int, option:int, username:str}
     """
+    if request_too_large():
+        return 'Payload too large', 413
     data = request.get_json() or {}
-    poll_id = int(data.get('poll_id', -1))
-    idx = int(data.get('option', -1))
-    user = data.get('username', '').strip()
-    poll = find_poll(poll_id)
-    if poll is None or not (0 <= idx < len(poll['options'])):
+    poll_id = parse_int(data.get('poll_id'))
+    idx = parse_int(data.get('option'))
+    user = normalize_username(data.get('username'))
+    if poll_id is None or idx is None:
+        return 'Invalid poll or option', 400
+    if not user:
+        return 'Invalid username', 400
+
+    conn = get_db()
+    row = conn.execute("SELECT * FROM polls WHERE id = ?", (poll_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return 'Poll or option not found', 404
+    if poll_is_expired(row) or row['closed']:
+        conn.execute("UPDATE polls SET closed = 1 WHERE id = ?", (poll_id,))
+        conn.commit()
+        conn.close()
+        return 'Poll closed', 409
+
+    options = json.loads(row['options'])
+    if not (0 <= idx < len(options)):
+        conn.close()
         return 'Poll or option not found', 404
 
-    # Prevent double‑voting
-    previous = poll['voters'].get(user)
+    votes = json.loads(row['votes'])
+    voters = json.loads(row['voters'])
+    previous = voters.get(user)
     if previous is not None:
         if previous == idx:
+            conn.close()
             return '', 204  # same vote, nothing changes
-        poll['votes'][previous] -= 1  # remove prior vote
+        votes[previous] = max(votes[previous] - 1, 0)
 
-    poll['voters'][user] = idx
-    poll['votes'][idx] += 1
+    voters[user] = idx
+    votes[idx] += 1
+    conn.execute(
+        "UPDATE polls SET votes = ?, voters = ? WHERE id = ?",
+        (json.dumps(votes), json.dumps(voters), poll_id),
+    )
+    conn.commit()
+    conn.close()
+    return '', 204
+
+
+@app.route('/poll/close', methods=['POST'])
+@limiter.limit("10 per minute")
+def close_poll():
+    if request_too_large():
+        return 'Payload too large', 413
+    data = request.get_json() or {}
+    poll_id = parse_int(data.get('poll_id'))
+    user = normalize_username(data.get('username'))
+    if poll_id is None or not user:
+        return 'Invalid request', 400
+    conn = get_db()
+    row = conn.execute("SELECT created_by FROM polls WHERE id = ?", (poll_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return 'Poll not found', 404
+    if row['created_by'] != user:
+        conn.close()
+        return 'Forbidden', 403
+    conn.execute("UPDATE polls SET closed = 1 WHERE id = ?", (poll_id,))
+    conn.commit()
+    conn.close()
     return '', 204
 
 
@@ -250,8 +457,31 @@ def vote():
 #                      Messages fetch (chat + polls)
 # ---------------------------------------------------------------------
 @app.route('/messages')
+@limiter.limit("120 per minute")
 def get_messages():
-    return jsonify(messages)
+    conn = get_db()
+    chat_rows = conn.execute("SELECT payload, created_at FROM messages").fetchall()
+    poll_rows = conn.execute("SELECT * FROM polls").fetchall()
+
+    chats = []
+    for row in chat_rows:
+        payload = json.loads(row['payload'])
+        payload['timestamp'] = payload.get('timestamp') or datetime.fromisoformat(
+            row['created_at']
+        ).strftime('%I:%M %p')
+        chats.append((row['created_at'], payload))
+
+    polls = []
+    for row in poll_rows:
+        if poll_is_expired(row) and not row['closed']:
+            conn.execute("UPDATE polls SET closed = 1 WHERE id = ?", (row['id'],))
+            conn.commit()
+            row = conn.execute("SELECT * FROM polls WHERE id = ?", (row['id'],)).fetchone()
+        polls.append((row['created_at'], poll_row_to_payload(row)))
+
+    combined = [item for _, item in sorted(chats + polls, key=lambda x: x[0])]
+    conn.close()
+    return jsonify(combined)
 
 
 # ---------------------------------------------------------------------
@@ -259,7 +489,12 @@ def get_messages():
 # ---------------------------------------------------------------------
 if __name__ == '__main__':
     print('Server running at https://<YOUR‑PC‑IP>:5000')
+    cert_path = BASE_DIR / 'cert.pem'
+    key_path = BASE_DIR / 'key.pem'
+    ssl_context = None
+    if cert_path.exists() and key_path.exists():
+        ssl_context = (str(cert_path), str(key_path))
     app.run(host='0.0.0.0',
             port=5000,
-            ssl_context=('cert.pem', 'key.pem'),
-            debug=True)
+            ssl_context=ssl_context,
+            debug=False)
